@@ -75,6 +75,42 @@ typings/
 # local version cache
 .wwebjs_cache/
 
+# WhatsApp Web.js specific folders
+sessions/
+.wwebjs_auth/
+.wwebjs_cache/
+*.session.json
+
+# Build outputs
+dist/
+build/
+out/
+
+# Environment files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
 # IDE's
 .idea
 .vscode
+
+# OS generated files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+.parcel-cache/
+
+# SSL certificates
+ssl/
+*.pem
+*.key
+*.crt
