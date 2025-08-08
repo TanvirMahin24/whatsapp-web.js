@@ -177,26 +177,33 @@ function App() {
                 </header>
 
                 {/* QR Code Section */}
-                {qrCode && (
+                {(!status.isAuthenticated || !status.isReady || qrCode) && (
                     <div className="qr-section">
                         <div className="qr-content">
                             <h3>Scan QR Code</h3>
                             <p>
                                 Open WhatsApp on your phone and scan this code
                             </p>
-                            <div className="qr-container">
-                                <img
-                                    src={qrCode}
-                                    alt="QR Code"
-                                    className="qr-image"
-                                />
-                            </div>
+                            {qrCode ? (
+                                <div className="qr-container">
+                                    <img
+                                        src={qrCode}
+                                        alt="QR Code"
+                                        className="qr-image"
+                                    />
+                                </div>
+                            ) : (
+                                <div className="qr-loading">
+                                    <p>Waiting for QR code...</p>
+                                    <div className="loading-spinner"></div>
+                                </div>
+                            )}
                         </div>
                     </div>
                 )}
 
                 {/* Main Interface */}
-                {status.isReady && (
+                {status.isAuthenticated && status.isReady && (
                     <div className="main-interface">
                         {/* Tab Navigation */}
                         <div className="tab-navigation">
