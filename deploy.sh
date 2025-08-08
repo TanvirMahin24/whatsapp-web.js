@@ -79,18 +79,29 @@ cd client && npm install && npm run build && cd ..
 
 # Copy built frontend to dist folder
 print_blue "Copying frontend build files..."
+mkdir -p dist
 rm -rf dist/client
+
+# Check if client/dist exists
+if [ ! -d "client/dist" ]; then
+    print_error "client/dist directory not found. Frontend build may have failed."
+    exit 1
+fi
+
 cp -r client/dist dist/client
 
 # Verify frontend build files
 if [ ! -f "dist/client/index.html" ]; then
     print_error "Frontend build failed - index.html not found"
+    print_error "Contents of dist/client:"
+    ls -la dist/client/ 2>/dev/null || echo "dist/client directory is empty or doesn't exist"
     exit 1
 fi
 print_status "Frontend build files copied successfully"
 
 # Build the server
 print_blue "Building server..."
+mkdir -p dist/server
 npm run build:server
 
 # Verify server build files
