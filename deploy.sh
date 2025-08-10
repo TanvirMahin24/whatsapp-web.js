@@ -49,7 +49,7 @@ print_blue "Installing dependencies..."
 npm install
 
 # Set default backend URL if not provided
-BACKEND_URL=${BACKEND_URL:-"localhost:3000"}
+BACKEND_URL=${BACKEND_URL:-"localhost:4000"}
 print_blue "Using backend URL: $BACKEND_URL"
 
 # Update environment variables
