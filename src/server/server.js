@@ -26,7 +26,9 @@ app.use(
         credentials: true,
     })
 );
-app.use(express.json());
+// Increase body size limit for audio messages
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ limit: "50mb", extended: true }));
 app.use(express.static(path.join(__dirname, "../../dist/client")));
 
 // Store WhatsApp client instance
@@ -34,6 +36,7 @@ let client = null;
 let qrCodeData = null;
 let isAuthenticated = false;
 let isReady = false;
+let clientState = "INITIALIZING"; // Track the actual client state
 
 // Store pinned messages for each chat
 let pinnedMessages = new Map();
@@ -42,7 +45,7 @@ let pinnedMessages = new Map();
 let chatMedia = new Map();
 
 // Initialize WhatsApp client
-function initializeWhatsApp() {
+async function initializeWhatsApp() {
     client = new Client({
         authStrategy: new LocalAuth(),
         puppeteer: {
@@ -64,79 +67,1036 @@ function initializeWhatsApp() {
         qrCodeData = await qrcode.toDataURL(qr);
         isAuthenticated = false;
         isReady = false;
+        clientState = "QR_RECEIVED"; // Set QR state
 
         // Emit QR code to connected clients
         io.emit("qr", qrCodeData);
-        io.emit("status", { isAuthenticated, isReady });
+        io.emit("status", { isAuthenticated, isReady, clientState });
     });
 
     client.on("authenticated", () => {
         console.log("Client authenticated");
         isAuthenticated = true;
+        clientState = "AUTHENTICATED"; // Set initial state
         qrCodeData = null;
         io.emit("qr", null);
-        io.emit("status", { isAuthenticated, isReady });
+        io.emit("status", { isAuthenticated, isReady, clientState });
     });
 
     client.on("auth_failure", (msg) => {
         console.error("Authentication failure:", msg);
         isAuthenticated = false;
         isReady = false;
-        io.emit("status", { isAuthenticated, isReady });
+        clientState = "AUTH_FAILURE"; // Set failure state
+        io.emit("status", { isAuthenticated, isReady, clientState });
     });
 
     client.on("ready", () => {
         console.log("Client is ready!");
         isReady = true;
+        clientState = "READY"; // Set the state when client is ready
         qrCodeData = null;
         io.emit("qr", null);
-        io.emit("status", { isAuthenticated, isReady });
+        io.emit("status", { isAuthenticated, isReady, clientState });
+    });
+
+    client.on("disconnected", (reason) => {
+        console.log("Client disconnected:", reason);
+        isReady = false;
+        isAuthenticated = false;
+        clientState = "DISCONNECTED"; // Set disconnected state
+        qrCodeData = null;
+        io.emit("qr", null);
+        io.emit("status", { isAuthenticated, isReady, clientState });
+    });
+
+    client.on("change_state", (state) => {
+        console.log("Client state changed:", state);
+        clientState = state; // Store the actual state
+
+        // Update our local state based on the new state
+        if (state === "READY") {
+            isReady = true;
+        } else if (state === "CONFLICT" || state === "UNLAUNCHED") {
+            isReady = false;
+            isAuthenticated = false;
+        }
+
+        // Log the current state for debugging
+        console.log("[STATE] Current client state:", {
+            state: state,
+            clientState: clientState,
+            isReady: isReady,
+            isAuthenticated: isAuthenticated,
+        });
+
+        io.emit("status", { isAuthenticated, isReady, clientState });
+    });
+
+    client.on("loading_screen", (percent, message) => {
+        console.log("Loading screen:", percent + "%", message);
+        // Emit loading progress to frontend
+        io.emit("loading", { percent, message });
     });
 
     client.on("message", async (msg) => {
         console.log("Message received:", msg.body);
-        io.emit("message", {
-            from: msg.from,
-            body: msg.body,
-            timestamp: msg.timestamp,
+
+        // Prepare message data
+        const messageData = {
+            id: msg.id._serialized,
+            text: msg.body,
+            timestamp: new Date(msg.timestamp * 1000).toLocaleString(),
+            timestampSec: msg.timestamp,
+            sender: msg.from,
+            status: "delivered",
             fromMe: msg.fromMe,
-        });
+            chatId: msg.from, // For individual chats, chatId is the same as sender
+            hasMedia: msg.hasMedia,
+            mediaType: msg.type,
+            mediaUrl: null,
+            mediaMimeType: null,
+        };
+
+        // If this is a group message, the chatId should be the group ID
+        if (msg._data && msg._data.isGroupMsg) {
+            messageData.chatId = msg._data.chat.id._serialized;
+        }
+
+        // If message has media, try to download it
+        if (msg.hasMedia && msg.type === "ptt") {
+            // ptt = push to talk (voice message)
+            try {
+                const media = await msg.downloadMedia();
+                if (media && media.data) {
+                    messageData.mediaUrl = `data:${media.mimetype};base64,${media.data}`;
+                    messageData.mediaMimeType = media.mimetype;
+                }
+            } catch (mediaError) {
+                console.error(
+                    "Error downloading voice message media:",
+                    mediaError
+                );
+            }
+        } else if (msg.hasMedia && msg.type === "audio") {
+            try {
+                const media = await msg.downloadMedia();
+                if (media && media.data) {
+                    messageData.mediaUrl = `data:${media.mimetype};base64,${media.data}`;
+                    messageData.mediaMimeType = media.mimetype;
+                }
+            } catch (mediaError) {
+                console.error("Error downloading audio media:", mediaError);
+            }
+        }
+
+        io.emit("message", messageData);
     });
 
-    client.initialize();
+    try {
+        console.log("[INIT] Starting WhatsApp client initialization...");
+        await client.initialize();
+        console.log("[INIT] WhatsApp client initialization completed");
+
+        // Set up periodic health check to monitor client state
+        setInterval(() => {
+            if (client && clientState) {
+                console.log("[HEALTH] Client state check:", {
+                    state: clientState,
+                    isReady: isReady,
+                    isAuthenticated: isAuthenticated,
+                });
+            }
+        }, 30000); // Check every 30 seconds
+    } catch (error) {
+        console.error("[INIT] Failed to initialize WhatsApp client:", error);
+        isReady = false;
+        isAuthenticated = false;
+        io.emit("status", { isAuthenticated, isReady });
+    }
 }
 
 // API Routes
 app.get("/api/status", (req, res) => {
-    res.json({
+    const statusInfo = {
         isAuthenticated,
         isReady,
         qrCode: qrCodeData,
-    });
+        client: {
+            exists: !!client,
+            type: typeof client,
+            state: clientState,
+            hasStateProperty: client && "state" in client,
+            hasGetStateMethod: client && typeof client.getState === "function",
+            methods: client
+                ? Object.getOwnPropertyNames(client).filter(
+                      (name) => typeof client[name] === "function"
+                  )
+                : [],
+            properties: client ? Object.keys(client) : [],
+        },
+    };
+
+    console.log("[STATUS] Status request:", statusInfo);
+    res.json(statusInfo);
 });
 
 app.post("/api/send-message", async (req, res) => {
     try {
-        const { number, message } = req.body;
+        const { number, message, audioData, isVoiceMessage, mimeType } =
+            req.body;
 
-        if (!isReady) {
-            return res
-                .status(400)
-                .json({ error: "WhatsApp client is not ready" });
+        if (!client) {
+            console.error("[API] WhatsApp client is null or undefined");
+            return res.status(400).json({
+                error: "WhatsApp client is not initialized. Please wait for the service to start.",
+                details: {
+                    clientExists: false,
+                    isReady: false,
+                    isAuthenticated: false,
+                    clientState: "N/A",
+                },
+            });
         }
 
-        if (!number || !message) {
+        if (!isReady || !isAuthenticated) {
+            console.error(
+                "[API] WhatsApp client not ready or not authenticated:",
+                {
+                    clientExists: !!client,
+                    isReady: isReady,
+                    isAuthenticated: isAuthenticated,
+                    clientState: clientState,
+                    clientType: typeof client,
+                }
+            );
+            return res.status(400).json({
+                error: "WhatsApp client is not ready. Please wait for authentication.",
+                details: {
+                    clientExists: !!client,
+                    isReady: isReady,
+                    clientState: clientState,
+                    isAuthenticated: isAuthenticated,
+                    clientType: typeof client,
+                },
+            });
+        }
+
+        if (!number || (!message && !audioData && !req.body.attachmentData)) {
             return res
                 .status(400)
-                .json({ error: "Number and message are required" });
+                .json({ error: "Number and message content are required" });
         }
 
         const formattedNumber = number.includes("@c.us")
             ? number
             : `${number}@c.us`;
-        await client.sendMessage(formattedNumber, message);
 
-        res.json({ success: true, message: "Message sent successfully" });
+        if (isVoiceMessage && audioData) {
+            // Handle voice message
+            console.log("[API] Sending voice message to", formattedNumber);
+            console.log("[API] Audio data length:", audioData.length);
+            console.log(
+                "[API] Audio data preview:",
+                audioData.substring(0, 100)
+            );
+            console.log("[API] MIME type received:", mimeType);
+            console.log("[API] Request body keys:", Object.keys(req.body));
+
+            // Check if WhatsApp client is ready and authenticated
+            if (!client || !isReady || !isAuthenticated) {
+                console.error(
+                    "[API] WhatsApp client not ready for voice message:",
+                    {
+                        clientExists: !!client,
+                        isReady: isReady,
+                        isAuthenticated: isAuthenticated,
+                        state: clientState,
+                    }
+                );
+                return res.status(400).json({
+                    error: "WhatsApp client is not ready. Please wait for authentication.",
+                    details: {
+                        clientExists: !!client,
+                        isReady: isReady,
+                        isAuthenticated: isAuthenticated,
+                        state: clientState,
+                    },
+                });
+            }
+
+            // Additional check: ensure client is in a good state
+            // Since isReady and isAuthenticated are both true, we can proceed
+            // even if clientState is not explicitly set
+            if (!client) {
+                console.error("[API] WhatsApp client is null or undefined:", {
+                    clientExists: !!client,
+                    clientType: typeof client,
+                    clientState: clientState,
+                    isReady: isReady,
+                    isAuthenticated: isAuthenticated,
+                });
+
+                return res.status(400).json({
+                    error: "WhatsApp client is not properly initialized",
+                    details: {
+                        clientExists: !!client,
+                        clientType: typeof client,
+                        clientState: clientState,
+                        isReady: isReady,
+                        isAuthenticated: isAuthenticated,
+                    },
+                });
+            }
+
+            // If clientState is available, check if it's READY
+            // Otherwise, trust the isReady flag
+            if (clientState && clientState !== "READY") {
+                console.error(
+                    "[API] WhatsApp client not in READY state:",
+                    clientState
+                );
+                return res.status(400).json({
+                    error:
+                        "WhatsApp client not in ready state. Current state: " +
+                        clientState,
+                    details: {
+                        state: clientState,
+                        isReady: isReady,
+                        isAuthenticated: isAuthenticated,
+                    },
+                });
+            }
+
+            // If clientState is not set but client is ready and authenticated,
+            // set it to READY as a fallback
+            if (!clientState && isReady && isAuthenticated) {
+                console.log("[API] Setting clientState to READY as fallback");
+                clientState = "READY";
+            }
+
+            // Log the current state for debugging
+            console.log("[API] Voice message endpoint - Current state:", {
+                clientExists: !!client,
+                isReady: isReady,
+                isAuthenticated: isAuthenticated,
+                clientState: clientState,
+            });
+
+            // Check if audio data is too large (base64 is ~33% larger than binary)
+            const maxSizeBytes = 10 * 1024 * 1024; // 10MB limit
+            if (audioData.length > maxSizeBytes) {
+                console.error(
+                    "[API] Audio data too large:",
+                    audioData.length,
+                    "bytes"
+                );
+                return res.status(413).json({
+                    error: "Audio file too large. Please record a shorter message.",
+                    maxSize: "10MB",
+                });
+            }
+
+            try {
+                // Create MessageMedia object from base64 audio data
+                const { MessageMedia } = require("whatsapp-web.js");
+                console.log("[API] MessageMedia imported successfully");
+                console.log(
+                    "[API] MessageMedia constructor:",
+                    typeof MessageMedia
+                );
+                console.log(
+                    "[API] WhatsApp Web.js version:",
+                    require("whatsapp-web.js/package.json").version
+                );
+
+                // Clean up the MIME type - remove codec information and use standard formats
+                let cleanMimeType = mimeType || "audio/webm";
+                console.log("[API] Original MIME type:", mimeType);
+                console.log("[API] MIME type includes check:", {
+                    hasWebm: mimeType?.includes("webm"),
+                    hasMp4: mimeType?.includes("mp4"),
+                    hasM4a: mimeType?.includes("m4a"),
+                    hasWav: mimeType?.includes("wav"),
+                    hasOgg: mimeType?.includes("ogg"),
+                    hasMp3: mimeType?.includes("mp3"),
+                });
+
+                // Remove codec information and normalize to standard MIME types
+                if (cleanMimeType.includes("webm")) {
+                    cleanMimeType = "audio/webm";
+                } else if (
+                    cleanMimeType.includes("mp4") ||
+                    cleanMimeType.includes("m4a")
+                ) {
+                    cleanMimeType = "audio/mp4";
+                } else if (cleanMimeType.includes("wav")) {
+                    cleanMimeType = "audio/wav";
+                } else if (cleanMimeType.includes("ogg")) {
+                    cleanMimeType = "audio/ogg";
+                } else if (cleanMimeType.includes("mp3")) {
+                    cleanMimeType = "audio/mpeg";
+                } else {
+                    // Default to WebM for better compatibility
+                    cleanMimeType = "audio/webm";
+                }
+
+                // Set appropriate file extension based on MIME type
+                let fileExtension;
+                switch (cleanMimeType) {
+                    case "audio/webm":
+                        fileExtension = "webm";
+                        break;
+                    case "audio/mp4":
+                        fileExtension = "m4a";
+                        break;
+                    case "audio/wav":
+                        fileExtension = "wav";
+                        break;
+                    case "audio/ogg":
+                        fileExtension = "ogg";
+                        break;
+                    case "audio/mpeg":
+                        fileExtension = "mp3";
+                        break;
+                    default:
+                        fileExtension = "mp3"; // Default to MP3 for better compatibility
+                }
+
+                console.log("[API] File extension:", fileExtension);
+                console.log("[API] Final MIME type:", cleanMimeType);
+
+                // Ensure the base64 data is properly formatted (remove any data URL prefix)
+                let cleanAudioData = audioData;
+                console.log(
+                    "[API] Original audio data type:",
+                    typeof audioData
+                );
+                console.log(
+                    "[API] Original audio data starts with:",
+                    audioData.substring(0, 50)
+                );
+
+                if (audioData.startsWith("data:")) {
+                    cleanAudioData = audioData.split(",")[1];
+                    console.log(
+                        "[API] Removed data URL prefix, new length:",
+                        cleanAudioData.length
+                    );
+                }
+
+                // Validate base64 data
+                if (!cleanAudioData || cleanAudioData.length === 0) {
+                    throw new Error("Invalid audio data: empty or null");
+                }
+
+                // Check if the data looks like valid base64
+                if (!/^[A-Za-z0-9+/]*={0,2}$/.test(cleanAudioData)) {
+                    throw new Error("Invalid audio data: not valid base64");
+                }
+
+                // Check if the data is too short (likely corrupted)
+                if (cleanAudioData.length < 100) {
+                    throw new Error(
+                        "Invalid audio data: too short, likely corrupted"
+                    );
+                }
+
+                // Check if the data is too long (likely corrupted)
+                if (cleanAudioData.length > 50 * 1024 * 1024) {
+                    // 50MB limit
+                    throw new Error(
+                        "Invalid audio data: too long, likely corrupted"
+                    );
+                }
+
+                // Additional validation: ensure the base64 data can be properly decoded
+                try {
+                    const testBuffer = Buffer.from(cleanAudioData, "base64");
+                    if (testBuffer.length === 0) {
+                        throw new Error(
+                            "Invalid audio data: base64 decoding results in empty buffer"
+                        );
+                    }
+                    console.log(
+                        "[API] Base64 validation passed - decoded buffer length:",
+                        testBuffer.length
+                    );
+                } catch (decodeError) {
+                    console.error(
+                        "[API] Base64 decode test failed:",
+                        decodeError.message
+                    );
+                    throw new Error(
+                        `Invalid audio data: base64 decoding failed - ${decodeError.message}`
+                    );
+                }
+
+                // Try to optimize the audio data for better compatibility
+                let optimizedAudioData = cleanAudioData;
+                let optimizedMimeType = cleanMimeType;
+
+                // If the audio data is very large, try to optimize it
+                if (cleanAudioData.length > 5 * 1024 * 1024) {
+                    // 5MB
+                    console.log(
+                        "[API] Audio data is large, attempting optimization..."
+                    );
+
+                    try {
+                        // For WebM files, try to use a more compatible format
+                        if (cleanMimeType === "audio/webm") {
+                            // WebM can sometimes cause issues, try MP4 instead
+                            optimizedMimeType = "audio/mp4";
+                            console.log(
+                                "[API] Optimized MIME type from WebM to MP4 for better compatibility"
+                            );
+                        }
+
+                        // If still too large, try to suggest compression
+                        if (cleanAudioData.length > 10 * 1024 * 1024) {
+                            // 10MB
+                            console.log(
+                                "[API] Audio data is very large, suggesting compression"
+                            );
+                            // Note: We can't compress here, but we can log a warning
+                        }
+                    } catch (optimizeError) {
+                        console.log(
+                            "[API] Audio optimization failed, using original data:",
+                            optimizeError.message
+                        );
+                        // Continue with original data if optimization fails
+                    }
+                }
+
+                console.log("[API] Audio data validation passed");
+                console.log(
+                    "[API] Audio data starts with:",
+                    cleanAudioData.substring(0, 50)
+                );
+                console.log(
+                    "[API] Audio data length after cleaning:",
+                    cleanAudioData.length
+                );
+                console.log(
+                    "[API] Base64 validation regex test result:",
+                    /^[A-Za-z0-9+/]*={0,2}$/.test(cleanAudioData)
+                );
+
+                // Create MessageMedia with the cleaned MIME type
+                console.log("[API] Creating MessageMedia with:");
+                console.log("[API] - MIME type:", optimizedMimeType);
+                console.log("[API] - File extension:", fileExtension);
+                console.log(
+                    "[API] - Audio data length:",
+                    optimizedAudioData.length
+                );
+
+                let media;
+                try {
+                    media = new MessageMedia(
+                        optimizedMimeType,
+                        optimizedAudioData,
+                        `voice-message.${fileExtension}`
+                    );
+
+                    console.log("[API] MessageMedia created successfully");
+                    console.log("[API] MessageMedia object:", typeof media);
+                    console.log(
+                        "[API] MessageMedia properties:",
+                        Object.keys(media)
+                    );
+
+                    // Validate the created media object
+                    if (!media || typeof media !== "object") {
+                        throw new Error(
+                            "MessageMedia creation failed - invalid object returned"
+                        );
+                    }
+
+                    if (!media.data || !media.mimetype) {
+                        throw new Error(
+                            "MessageMedia creation failed - missing required properties"
+                        );
+                    }
+
+                    console.log("[API] MessageMedia validation passed");
+                } catch (mediaCreationError) {
+                    console.error(
+                        "[API] Error creating MessageMedia:",
+                        mediaCreationError
+                    );
+
+                    // Try to create with fallback MIME type
+                    try {
+                        console.log(
+                            "[API] Attempting fallback MessageMedia creation with audio/mpeg..."
+                        );
+                        media = new MessageMedia(
+                            "audio/mpeg",
+                            optimizedAudioData,
+                            "voice-message.mp3"
+                        );
+                        console.log(
+                            "[API] Fallback MessageMedia created successfully"
+                        );
+                    } catch (fallbackMediaError) {
+                        console.error(
+                            "[API] Fallback MessageMedia creation also failed:",
+                            fallbackMediaError
+                        );
+                        throw new Error(
+                            `Failed to create MessageMedia: ${mediaCreationError.message}. Fallback also failed: ${fallbackMediaError.message}`
+                        );
+                    }
+                }
+
+                // Try different approaches to send the voice message
+                let sent = false;
+                let lastError = null;
+
+                // Create a timeout promise to prevent hanging
+                let timeoutId;
+                const timeoutPromise = new Promise((_, reject) => {
+                    timeoutId = setTimeout(() => {
+                        reject(
+                            new Error(
+                                "Voice message sending timed out after 30 seconds"
+                            )
+                        );
+                    }, 30000); // 30 second timeout
+                });
+
+                // Helper function to clear timeout
+                const clearTimeoutId = () => {
+                    if (timeoutId) {
+                        clearTimeout(timeoutId);
+                        timeoutId = null;
+                    }
+                };
+
+                try {
+                    // Method 1: Try sending as regular audio with voice message options
+                    try {
+                        console.log(
+                            "[API] Attempting to send as voice message..."
+                        );
+                        console.log("[API] Target number:", formattedNumber);
+                        console.log("[API] Media object type:", typeof media);
+                        console.log(
+                            "[API] Media object keys:",
+                            Object.keys(media)
+                        );
+                        console.log("[API] Client ready state:", isReady);
+                        console.log(
+                            "[API] Client authenticated:",
+                            isAuthenticated
+                        );
+
+                        // Try to send as a voice message with proper options
+                        const messageOptions = {
+                            sendAudioAsVoice: true,
+                            // Add additional options to help with voice message detection
+                            mimetype: optimizedMimeType,
+                            filename: `voice-message.${fileExtension}`,
+                            // Try to set voice message properties
+                            voiceMessage: true,
+                            ptt: true, // Push-to-talk flag
+                        };
+
+                        console.log("[API] Message options:", messageOptions);
+
+                        // Race between sending and timeout
+                        await Promise.race([
+                            client.sendMessage(
+                                formattedNumber,
+                                media,
+                                messageOptions
+                            ),
+                            timeoutPromise,
+                        ]);
+
+                        // Clear timeout since we succeeded
+                        clearTimeoutId();
+
+                        console.log(
+                            "[API] Voice message sent successfully with voice options"
+                        );
+                        sent = true;
+                    } catch (voiceError) {
+                        console.log(
+                            "[API] Voice message send failed:",
+                            voiceError.message
+                        );
+                        console.log(
+                            "[API] Voice error stack:",
+                            voiceError.stack
+                        );
+                        console.log("[API] Voice error name:", voiceError.name);
+                        lastError = voiceError;
+
+                        // Method 2: Try sending as regular audio without voice options
+                        try {
+                            console.log(
+                                "[API] Attempting to send as regular audio..."
+                            );
+                            await Promise.race([
+                                client.sendMessage(formattedNumber, media),
+                                timeoutPromise,
+                            ]);
+                            console.log(
+                                "[API] Voice message sent successfully as regular audio"
+                            );
+                            sent = true;
+                        } catch (audioError) {
+                            console.log(
+                                "[API] Regular audio send failed:",
+                                audioError.message
+                            );
+                            console.log(
+                                "[API] Audio error stack:",
+                                audioError.stack
+                            );
+                            console.log(
+                                "[API] Audio error name:",
+                                audioError.name
+                            );
+                            lastError = audioError;
+
+                            // Method 3: Try sending as document
+                            try {
+                                console.log(
+                                    "[API] Attempting to send as document..."
+                                );
+                                console.log(
+                                    "[API] Creating document media with clean audio data"
+                                );
+                                const documentMedia = new MessageMedia(
+                                    "application/octet-stream",
+                                    optimizedAudioData,
+                                    `voice-message.${fileExtension}`
+                                );
+
+                                await Promise.race([
+                                    client.sendMessage(
+                                        formattedNumber,
+                                        documentMedia
+                                    ),
+                                    timeoutPromise,
+                                ]);
+                                console.log(
+                                    "[API] Voice message sent as document successfully"
+                                );
+                                sent = true;
+                            } catch (documentError) {
+                                console.log(
+                                    "[API] Document send failed:",
+                                    documentError.message
+                                );
+                                console.log(
+                                    "[API] Document error stack:",
+                                    documentError.stack
+                                );
+                                lastError = documentError;
+
+                                // Method 4: Try with different MIME type
+                                try {
+                                    console.log(
+                                        "[API] Attempting with fallback MIME type..."
+                                    );
+                                    console.log(
+                                        "[API] Creating fallback media with MP3 MIME type"
+                                    );
+                                    const fallbackMedia = new MessageMedia(
+                                        "audio/mpeg",
+                                        optimizedAudioData,
+                                        "voice-message.mp3"
+                                    );
+
+                                    await Promise.race([
+                                        client.sendMessage(
+                                            formattedNumber,
+                                            fallbackMedia
+                                        ),
+                                        timeoutPromise,
+                                    ]);
+                                    console.log(
+                                        "[API] Voice message sent with fallback MIME type"
+                                    );
+                                    sent = true;
+                                } catch (fallbackError) {
+                                    console.log(
+                                        "[API] Fallback send failed:",
+                                        fallbackError.message
+                                    );
+                                    console.log(
+                                        "[API] Fallback error stack:",
+                                        fallbackError.stack
+                                    );
+                                    lastError = fallbackError;
+
+                                    // Method 5: Try with base64 data directly
+                                    try {
+                                        console.log(
+                                            "[API] Attempting with base64 data..."
+                                        );
+                                        const base64Media = new MessageMedia(
+                                            "text/plain",
+                                            Buffer.from(
+                                                optimizedAudioData,
+                                                "base64"
+                                            ).toString("base64"),
+                                            "voice-message.txt"
+                                        );
+
+                                        await Promise.race([
+                                            client.sendMessage(
+                                                formattedNumber,
+                                                base64Media
+                                            ),
+                                            timeoutPromise,
+                                        ]);
+                                        console.log(
+                                            "[API] Voice message sent as base64 text"
+                                        );
+                                        sent = true;
+                                    } catch (base64Error) {
+                                        console.log(
+                                            "[API] Base64 send failed:",
+                                            base64Error.message
+                                        );
+                                        lastError = base64Error;
+
+                                        // Method 6: Final fallback - send text message about failure
+                                        try {
+                                            console.log(
+                                                "[API] Attempting final fallback - sending failure notification..."
+                                            );
+                                            const failureMessage = `🎤 Voice message could not be sent. Please try recording a shorter message or check your connection.`;
+
+                                            await Promise.race([
+                                                client.sendMessage(
+                                                    formattedNumber,
+                                                    failureMessage
+                                                ),
+                                                timeoutPromise,
+                                            ]);
+                                            console.log(
+                                                "[API] Failure notification sent successfully"
+                                            );
+
+                                            // Return success but with a note about the fallback
+                                            return res.json({
+                                                success: true,
+                                                message:
+                                                    "Voice message could not be sent as audio, but failure notification was delivered",
+                                                method: "fallback notification",
+                                                warning:
+                                                    "The voice message could not be sent as audio. Please try recording a shorter message.",
+                                                details: {
+                                                    originalError:
+                                                        lastError?.message,
+                                                    mimeType: optimizedMimeType,
+                                                    dataLength:
+                                                        optimizedAudioData.length,
+                                                },
+                                            });
+                                        } catch (finalError) {
+                                            console.log(
+                                                "[API] Final fallback also failed:",
+                                                finalError.message
+                                            );
+                                            lastError = finalError;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (sent) {
+                        res.json({
+                            success: true,
+                            message: "Voice message sent successfully",
+                            method: "voice message",
+                        });
+                        return;
+                    } else {
+                        // All methods failed - provide detailed error information
+                        console.error(
+                            "[API] All voice message sending methods failed. Final analysis:"
+                        );
+                        console.error("[API] MIME type:", cleanMimeType);
+                        console.error("[API] File extension:", fileExtension);
+                        console.error(
+                            "[API] Audio data length:",
+                            cleanAudioData.length
+                        );
+                        console.error(
+                            "[API] Audio data preview:",
+                            cleanAudioData.substring(0, 100)
+                        );
+                        console.error("[API] Client ready state:", isReady);
+                        console.error(
+                            "[API] Client authenticated:",
+                            isAuthenticated
+                        );
+                        console.error("[API] Client info:", {
+                            isReady: isReady,
+                            isAuthenticated: isAuthenticated,
+                            state: clientState,
+                        });
+                        console.error(
+                            "[API] Last error encountered:",
+                            lastError
+                        );
+
+                        // Return a more helpful error response
+                        const errorMessage = lastError
+                            ? `Failed to send voice message: ${lastError.message}`
+                            : "Failed to send voice message: All sending methods failed";
+
+                        const suggestions = [
+                            "Check if the audio format is supported by WhatsApp",
+                            "Try recording a shorter message (under 1 minute)",
+                            "Ensure the audio file is not corrupted",
+                            "Check WhatsApp Web connection status",
+                        ];
+
+                        return res.status(500).json({
+                            success: false,
+                            error: errorMessage,
+                            suggestions: suggestions,
+                            details: {
+                                mimeType: cleanMimeType,
+                                fileExtension: fileExtension,
+                                dataLength: cleanAudioData.length,
+                                clientReady: isReady,
+                                clientAuthenticated: isAuthenticated,
+                                lastError: lastError
+                                    ? {
+                                          message: lastError.message,
+                                          name: lastError.name,
+                                          stack: lastError.stack,
+                                      }
+                                    : null,
+                            },
+                        });
+                    }
+                } catch (mediaError) {
+                    console.error(
+                        "[API] Error creating MessageMedia:",
+                        mediaError
+                    );
+                    console.error("[API] Error name:", mediaError.name);
+                    console.error("[API] Error stack:", mediaError.stack);
+                    console.error("[API] Audio data type:", typeof audioData);
+                    console.error("[API] Audio data length:", audioData.length);
+                    console.error("[API] Client state:", {
+                        isReady: isReady,
+                        isAuthenticated: isAuthenticated,
+                        state: clientState,
+                    });
+
+                    // If MessageMedia creation fails, it's likely a format issue
+                    res.status(500).json({
+                        error: "Failed to create audio message. The audio format may not be supported.",
+                        details: mediaError.message,
+                        suggestions: [
+                            "Try recording a shorter message",
+                            "Ensure the audio format is WebM, MP4, WAV, or OGG",
+                            "Check if WhatsApp Web is up to date",
+                        ],
+                    });
+                } finally {
+                    // Always clear the timeout to prevent memory leaks
+                    clearTimeoutId();
+                }
+            } catch (error) {
+                console.error("Error sending message:", error);
+                res.status(500).json({ error: "Failed to send message" });
+            }
+        } else if (req.body.attachmentData && req.body.attachmentType) {
+            // Handle file attachment
+            const { attachmentData, attachmentType, attachmentName, caption } =
+                req.body;
+
+            console.log("[API] Sending file attachment to", formattedNumber);
+            console.log("[API] Attachment type:", attachmentType);
+            console.log("[API] Attachment name:", attachmentName);
+            console.log("[API] Caption:", caption);
+            console.log("[API] Data length:", attachmentData.length);
+
+            try {
+                // Create MessageMedia object from base64 attachment data
+                const { MessageMedia } = require("whatsapp-web.js");
+
+                // Clean up the base64 data (remove any data URL prefix)
+                let cleanAttachmentData = attachmentData;
+                if (attachmentData.startsWith("data:")) {
+                    cleanAttachmentData = attachmentData.split(",")[1];
+                }
+
+                // Validate base64 data
+                if (!cleanAttachmentData || cleanAttachmentData.length === 0) {
+                    throw new Error("Invalid attachment data: empty or null");
+                }
+
+                // Check if the data looks like valid base64
+                if (!/^[A-Za-z0-9+/]*={0,2}$/.test(cleanAttachmentData)) {
+                    throw new Error(
+                        "Invalid attachment data: not valid base64"
+                    );
+                }
+
+                // Create MessageMedia with the attachment data
+                const media = new MessageMedia(
+                    attachmentType,
+                    cleanAttachmentData,
+                    attachmentName || "attachment"
+                );
+
+                console.log(
+                    "[API] MessageMedia created successfully for attachment"
+                );
+
+                // Send the attachment with optional caption
+                if (caption) {
+                    await client.sendMessage(formattedNumber, media, {
+                        caption,
+                    });
+                } else {
+                    await client.sendMessage(formattedNumber, media);
+                }
+
+                res.json({
+                    success: true,
+                    message: "File attachment sent successfully",
+                    type: attachmentType,
+                    name: attachmentName,
+                });
+            } catch (attachmentError) {
+                console.error(
+                    "[API] Error sending attachment:",
+                    attachmentError
+                );
+                res.status(500).json({
+                    error: "Failed to send attachment",
+                    details: attachmentError.message,
+                    suggestions: [
+                        "Check if the file format is supported by WhatsApp",
+                        "Ensure the file is not corrupted",
+                        "Try with a smaller file size",
+                        "Check WhatsApp Web connection status",
+                    ],
+                });
+            }
+        } else {
+            // Handle regular text message
+            await client.sendMessage(formattedNumber, message);
+            res.json({ success: true, message: "Message sent successfully" });
+        }
     } catch (error) {
         console.error("Error sending message:", error);
         res.status(500).json({ error: "Failed to send message" });
@@ -145,10 +1105,16 @@ app.post("/api/send-message", async (req, res) => {
 
 app.get("/api/contacts", async (req, res) => {
     try {
-        if (!isReady) {
-            return res
-                .status(400)
-                .json({ error: "WhatsApp client is not ready" });
+        if (!isReady || !isAuthenticated) {
+            return res.status(400).json({
+                error: "WhatsApp client is not ready. Please wait for authentication.",
+                details: {
+                    clientExists: !!client,
+                    isReady: isReady,
+                    isAuthenticated: isAuthenticated,
+                    state: clientState,
+                },
+            });
         }
 
         const contacts = await client.getContacts();
@@ -169,10 +1135,16 @@ app.get("/api/contacts", async (req, res) => {
 
 app.get("/api/chats", async (req, res) => {
     try {
-        if (!isReady) {
-            return res
-                .status(400)
-                .json({ error: "WhatsApp client is not ready" });
+        if (!isReady || !isAuthenticated) {
+            return res.status(400).json({
+                error: "WhatsApp client is not ready. Please wait for authentication.",
+                details: {
+                    clientExists: !!client,
+                    isReady: isReady,
+                    isAuthenticated: isAuthenticated,
+                    state: clientState,
+                },
+            });
         }
 
         const chats = await client.getChats();
@@ -224,10 +1196,16 @@ app.get("/api/chats", async (req, res) => {
 
 app.get("/api/chat-messages/:chatId", async (req, res) => {
     try {
-        if (!isReady) {
-            return res
-                .status(400)
-                .json({ error: "WhatsApp client is not ready" });
+        if (!isReady || !isAuthenticated) {
+            return res.status(400).json({
+                error: "WhatsApp client is not ready. Please wait for authentication.",
+                details: {
+                    clientExists: !!client,
+                    isReady: isReady,
+                    isAuthenticated: isAuthenticated,
+                    state: clientState,
+                },
+            });
         }
 
         const { chatId } = req.params;
@@ -436,10 +1414,16 @@ app.get("/api/chat-messages/:chatId", async (req, res) => {
 // Get profile picture for a contact or chat
 app.get("/api/profile-picture/:chatId", async (req, res) => {
     try {
-        if (!isReady) {
-            return res
-                .status(400)
-                .json({ error: "WhatsApp client is not ready" });
+        if (!isReady || !isAuthenticated) {
+            return res.status(400).json({
+                error: "WhatsApp client is not ready. Please wait for authentication.",
+                details: {
+                    clientExists: !!client,
+                    isReady: isReady,
+                    isAuthenticated: isAuthenticated,
+                    state: clientState,
+                },
+            });
         }
 
         const { chatId } = req.params;
@@ -470,10 +1454,16 @@ app.get("/api/profile-picture/:chatId", async (req, res) => {
 // Proxy profile picture image bytes to the frontend to avoid CORS/auth issues
 app.get("/api/profile-picture/:chatId/image", async (req, res) => {
     try {
-        if (!isReady) {
-            return res
-                .status(400)
-                .json({ error: "WhatsApp client is not ready" });
+        if (!isReady || !isAuthenticated) {
+            return res.status(400).json({
+                error: "WhatsApp client is not ready. Please wait for authentication.",
+                details: {
+                    clientExists: !!client,
+                    isReady: isReady,
+                    isAuthenticated: isAuthenticated,
+                    state: clientState,
+                },
+            });
         }
 
         const { chatId } = req.params;
@@ -520,10 +1510,16 @@ app.get("/api/profile-picture/:chatId/image", async (req, res) => {
 // Pin/Unpin a message
 app.post("/api/pin-message", async (req, res) => {
     try {
-        if (!isReady) {
-            return res
-                .status(400)
-                .json({ error: "WhatsApp client is not ready" });
+        if (!isReady || !isAuthenticated) {
+            return res.status(400).json({
+                error: "WhatsApp client is not ready. Please wait for authentication.",
+                details: {
+                    clientExists: !!client,
+                    isReady: isReady,
+                    isAuthenticated: isAuthenticated,
+                    state: clientState,
+                },
+            });
         }
 
         const { chatId, messageId, action } = req.body; // action: 'pin' or 'unpin'
@@ -595,10 +1591,16 @@ app.get("/api/pinned-messages/:chatId", async (req, res) => {
 // Get media gallery for a chat
 app.get("/api/chat-media/:chatId", async (req, res) => {
     try {
-        if (!isReady) {
-            return res
-                .status(400)
-                .json({ error: "WhatsApp client is not ready" });
+        if (!isReady || !isAuthenticated) {
+            return res.status(400).json({
+                error: "WhatsApp client is not ready. Please wait for authentication.",
+                details: {
+                    clientExists: !!client,
+                    isReady: isReady,
+                    isAuthenticated: isAuthenticated,
+                    state: clientState,
+                },
+            });
         }
 
         const { chatId } = req.params;
@@ -662,8 +1664,16 @@ app.get("/api/chat-media/:chatId", async (req, res) => {
 // Mark chat as seen/read
 app.post("/api/mark-chat-seen/:chatId", async (req, res) => {
     try {
-        if (!isReady) {
-            return res.status(503).json({ error: "WhatsApp not ready" });
+        if (!isReady || !isAuthenticated) {
+            return res.status(503).json({
+                error: "WhatsApp client is not ready. Please wait for authentication.",
+                details: {
+                    clientExists: !!client,
+                    isReady: isReady,
+                    isAuthenticated: isAuthenticated,
+                    state: clientState,
+                },
+            });
         }
 
         const { chatId } = req.params;
@@ -693,8 +1703,45 @@ app.get("/health", (req, res) => {
         whatsapp: {
             isAuthenticated,
             isReady,
+            clientState: clientState,
+            clientExists: !!client,
         },
     });
+});
+
+// Test client endpoint
+app.get("/api/test-client", async (req, res) => {
+    try {
+        if (!client) {
+            return res.status(400).json({
+                error: "Client not initialized",
+                details: { clientExists: false },
+            });
+        }
+
+        const clientInfo = {
+            type: typeof client,
+            hasState: "state" in client,
+            state: clientState,
+            hasGetState: typeof client.getState === "function",
+            methods: Object.getOwnPropertyNames(client).filter(
+                (name) => typeof client[name] === "function"
+            ),
+            properties: Object.keys(client),
+        };
+
+        res.json({
+            success: true,
+            clientInfo,
+            isReady,
+            isAuthenticated,
+        });
+    } catch (error) {
+        res.status(500).json({
+            error: "Error testing client",
+            details: error.message,
+        });
+    }
 });
 
 // Serve React app for all other routes
@@ -707,7 +1754,7 @@ io.on("connection", (socket) => {
     console.log("Client connected");
 
     // Send current status to new client
-    socket.emit("status", { isAuthenticated, isReady });
+    socket.emit("status", { isAuthenticated, isReady, clientState });
     if (qrCodeData) {
         socket.emit("qr", qrCodeData);
     }
@@ -723,7 +1770,9 @@ server.listen(PORT, () => {
     console.log(`Access the application at: http://localhost:${PORT}`);
 
     // Initialize WhatsApp client
-    initializeWhatsApp();
+    initializeWhatsApp().catch((error) => {
+        console.error("Failed to initialize WhatsApp client:", error);
+    });
 });
 
 // Graceful shutdown
