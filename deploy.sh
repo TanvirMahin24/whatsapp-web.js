@@ -35,7 +35,7 @@ if ! command -v docker &> /dev/null; then
 fi
 
 # Check if Docker Compose is installed
-if ! command -v docker-compose &> /dev/null; then
+if ! command -v docker compose &> /dev/null; then
     print_error "Docker Compose is not installed. Please install Docker Compose first."
     exit 1
 fi
@@ -113,14 +113,14 @@ print_status "Server build files created successfully"
 
 # Build and start with Docker Compose
 print_blue "Building and starting Docker containers..."
-docker-compose up -d --build
+docker compose up -d --build
 
 # Wait for containers to start
 print_blue "Waiting for containers to start..."
 sleep 10
 
 # Check if containers are running
-if docker-compose ps | grep -q "Up"; then
+if docker compose ps | grep -q "Up"; then
     print_status "✅ Deployment successful!"
     echo ""
     echo "🎉 WhatsApp Web Interface is now running!"
@@ -134,13 +134,13 @@ if docker-compose ps | grep -q "Up"; then
     echo "   To change backend URL, run: BACKEND_URL=your-domain.com ./deploy.sh"
     echo ""
     echo "📋 Useful commands:"
-    echo "   - View logs: docker-compose logs -f"
-    echo "   - Stop: docker-compose down"
-    echo "   - Restart: docker-compose restart"
-    echo "   - Rebuild: docker-compose up -d --build"
+    echo "   - View logs: docker compose logs -f"
+    echo "   - Stop: docker compose down"
+    echo "   - Restart: docker compose restart"
+    echo "   - Rebuild: docker compose up -d --build"
     echo ""
     print_warning "Remember to scan the QR code with your phone to connect WhatsApp!"
 else
-    print_error "❌ Deployment failed. Check logs with: docker-compose logs"
+    print_error "❌ Deployment failed. Check logs with: docker compose logs"
     exit 1
 fi
