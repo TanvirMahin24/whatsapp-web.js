@@ -238,6 +238,40 @@ app.get("/api/status", (req, res) => {
     };
 
     console.log("[STATUS] Status request:", statusInfo);
+
+    // If client is not authenticated and no QR code exists, try to regenerate one
+    if (!isAuthenticated && !qrCodeData && client && clientState !== "READY") {
+        console.log(
+            "[STATUS] No QR code available but client not authenticated, attempting to regenerate..."
+        );
+
+        // Try to get the current state and regenerate QR if needed
+        if (client && typeof client.getState === "function") {
+            try {
+                const currentState = client.getState();
+                console.log("[STATUS] Current client state:", currentState);
+
+                if (
+                    currentState === "UNLAUNCHED" ||
+                    currentState === "CONFLICT"
+                ) {
+                    console.log(
+                        "[STATUS] Client in state that should generate QR, attempting to reinitialize..."
+                    );
+                    // Reinitialize the client to trigger QR generation
+                    initializeWhatsApp().catch((error) => {
+                        console.error(
+                            "[STATUS] Failed to reinitialize client:",
+                            error
+                        );
+                    });
+                }
+            } catch (error) {
+                console.error("[STATUS] Error getting client state:", error);
+            }
+        }
+    }
+
     res.json(statusInfo);
 });
 
@@ -1739,6 +1773,58 @@ app.get("/api/test-client", async (req, res) => {
     } catch (error) {
         res.status(500).json({
             error: "Error testing client",
+            details: error.message,
+        });
+    }
+});
+
+// Force regenerate QR code endpoint
+app.post("/api/regenerate-qr", async (req, res) => {
+    try {
+        console.log("[API] Manual QR regeneration requested");
+
+        if (isAuthenticated && isReady) {
+            return res.status(400).json({
+                error: "Client is already authenticated and ready",
+                details: { isAuthenticated, isReady, clientState },
+            });
+        }
+
+        // Destroy existing client if it exists
+        if (client) {
+            console.log("[API] Destroying existing client");
+            try {
+                await client.destroy();
+            } catch (error) {
+                console.warn("[API] Error destroying client:", error);
+            }
+        }
+
+        // Reset state
+        client = null;
+        qrCodeData = null;
+        isAuthenticated = false;
+        isReady = false;
+        clientState = "INITIALIZING";
+
+        // Emit status update
+        io.emit("status", { isAuthenticated, isReady, clientState });
+        io.emit("qr", null);
+
+        // Reinitialize client
+        console.log("[API] Reinitializing WhatsApp client");
+        await initializeWhatsApp();
+
+        res.json({
+            success: true,
+            message:
+                "WhatsApp client reinitialized, QR code should appear shortly",
+            details: { clientState, isAuthenticated, isReady },
+        });
+    } catch (error) {
+        console.error("[API] Error regenerating QR:", error);
+        res.status(500).json({
+            error: "Failed to regenerate QR code",
             details: error.message,
         });
     }
