@@ -1197,10 +1197,8 @@ app.get("/api/chats", async (req, res) => {
                         unreadCount: chat.unreadCount,
                         lastMessage: latestMessage ? latestMessage.body : "",
                         timestamp: latestMessage
-                            ? new Date(
-                                  latestMessage.timestamp * 1000
-                              ).toLocaleString()
-                            : "",
+                            ? latestMessage.timestamp
+                            : null, // Send raw timestamp
                         hasProfilePic: false, // Will be updated separately
                     };
                 } catch (error) {
